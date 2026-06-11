@@ -3,13 +3,17 @@ from telegram import Update
 from dotenv import load_dotenv
 from groq import Groq
 import os
+import re
 import requests
 
 load_dotenv()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 SALES_API_URL = os.environ.get("SALES_AGENT_API_BASE_URL", "")
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "").lower()
+
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ==========================================
 # CONFIGURATION
@@ -38,7 +42,6 @@ INFORMATION_TOPICS = {
     "contact": "Innovation City contact information and how to get in touch with the team",
 }
 
-# Store sessions and language preferences per user
 conversations = {}
 user_languages = {}
 
@@ -94,6 +97,28 @@ async def ask_sky(chat_id, question):
 
     return bot_reply
 
+async def route_command(cmd, args, update, context):
+    context.args = args.split() if args else []
+    if cmd == "start":
+        await start(update, context)
+    elif cmd == "help":
+        await help_command(update, context)
+    elif cmd == "ask":
+        await ask(update, context)
+    elif cmd == "status":
+        await status(update, context)
+    elif cmd == "information":
+        await information(update, context)
+    elif cmd == "language":
+        await language(update, context)
+    elif cmd == "reset":
+        await reset(update, context)
+    else:
+        await update.message.reply_text(
+            f"Unknown command `!{cmd}`. Type `!help` for available commands.",
+            parse_mode="Markdown"
+        )
+
 # ==========================================
 # COMMANDS
 # ==========================================
@@ -139,7 +164,10 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     question = " ".join(context.args)
 
     if not question:
-        await update.message.reply_text("Please provide a question.\nExample: `!ask What licenses are available?`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Please provide a question.\nExample: `!ask What licenses are available?`",
+            parse_mode="Markdown"
+        )
         return
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -189,7 +217,6 @@ async def information(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     lang = " ".join(context.args).lower()
-
     supported = list(SYSTEM_PROMPTS.keys())
 
     if not lang or lang not in supported:
@@ -201,43 +228,71 @@ async def language(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_languages[chat_id] = lang
-    await update.message.reply_text(f"✅ Language set to *{lang.capitalize()}*.", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"✅ Language set to *{lang.capitalize()}*.",
+        parse_mode="Markdown"
+    )
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     conversations[chat_id] = []
     await update.message.reply_text("🔄 Session reset. Starting fresh — how can I help you?")
 
+# ==========================================
+# MESSAGE HANDLER
+# ==========================================
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     text = update.message.text
+    is_group = update.message.chat.type in ["group", "supergroup"]
 
-    # Handle ! commands sent as plain messages
+    # Handle ! commands
     if text.startswith("!"):
         parts = text[1:].split(" ", 1)
         cmd = parts[0].lower()
         args = parts[1] if len(parts) > 1 else ""
-        context.args = args.split() if args else []
-
-        if cmd == "start":
-            await start(update, context)
-        elif cmd == "help":
-            await help_command(update, context)
-        elif cmd == "ask":
-            await ask(update, context)
-        elif cmd == "status":
-            await status(update, context)
-        elif cmd == "information":
-            await information(update, context)
-        elif cmd == "language":
-            await language(update, context)
-        elif cmd == "reset":
-            await reset(update, context)
-        else:
-            await update.message.reply_text(f"Unknown command `!{cmd}`. Type `!help` for available commands.", parse_mode="Markdown")
+        await route_command(cmd, args, update, context)
         return
 
-    # Regular message — send to Sky
+    # Group chat logic
+    if is_group:
+        mentioned = (
+            BOT_USERNAME in text.lower() or
+            (update.message.entities and any(
+                e.type == "mention" for e in update.message.entities
+            ))
+        )
+        if not mentioned:
+            return
+
+        # Strip the @mention case-insensitively
+        clean_text = re.sub(
+            re.escape(f"@{BOT_USERNAME}"), "", text, flags=re.IGNORECASE
+        ).strip()
+
+        if not clean_text:
+            await update.message.reply_text(
+                "Yes? How can I help you? Type `!help` to see what I can do.",
+                parse_mode="Markdown"
+            )
+            return
+
+        # If mention + command e.g. "@bot !help"
+        if clean_text.startswith("!"):
+            parts = clean_text[1:].split(" ", 1)
+            cmd = parts[0].lower()
+            args = parts[1] if len(parts) > 1 else ""
+            await route_command(cmd, args, update, context)
+            return
+
+        # Regular mention — ask Sky
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        reply = await ask_sky(chat_id, clean_text)
+        await update.message.reply_text(reply)
+        return
+
+    # Private chat — respond to everything
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     reply = await ask_sky(chat_id, text)
     await update.message.reply_text(reply)
